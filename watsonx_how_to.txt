@@ -1,0 +1,14 @@
+1. You must create a project at Watsonx not any IBM cloud project.
+
+Go to IBM Cloud Home Page
+Click on +
+Click on watsonx
+Click on Launch
+Select Project from the "Project or deployment space" drop-down list
+Create API Key. Click on your profile icon at the top right, click on Profile and settings, click User API key
+
+How to create a WatsonX project?
+
+Goto this url, https://cloud.ibm.com/catalog/services/watsonxai-runtime
+
+Reference: https://github.com/IBM/watsonx-ai-samples/blob/40e58639fddb6127924c7b7bf2bfd79959b1d092/cloud/notebooks/python_sdk/experiments/autoai_rag/Use%20AutoAI%20RAG%20and%20Chroma%20to%20create%20a%20pattern%20about%20IBM.ipynb

@@ -1,0 +1,6 @@
+langchain==0.3.27
+pandas==2.1.4 
+torch==2.8.0
+transformers==4.55.4 
+ibm_watson_machine_learning==1.0.368 
+docling==2.47.1
