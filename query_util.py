@@ -1,4 +1,4 @@
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_ibm import WatsonxLLM

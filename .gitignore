@@ -21,4 +21,8 @@ venv/
 *.pyd
 *.db
 *.log
-chromadb/
+# Vector DB - must not be committed
+chroma_db/
+# PDF files
+*.pdf
+input/*.pdf
