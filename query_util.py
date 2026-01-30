@@ -12,23 +12,41 @@ import os
 # --------------------------------------------------
 # PDF → Chroma ingestion
 # --------------------------------------------------
-def process_pdf(
-    pdf_path,
+def process_document(
+    file_path,
     persist_directory="./chroma_db",
     embeddings_model_name="sentence-transformers/all-MiniLM-L6-v2"
 ):
     """
-    Load a PDF, split it into chunks, embed, and store in Chroma DB
+    Load a document (PDF, DOCX, or TXT), split it into chunks, embed, and store in Chroma DB
     """
-
-    # Load PDF
-    loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
+    from pathlib import Path
+    
+    file_extension = Path(file_path).suffix.lower()
+    
+    # Load document based on file type
+    if file_extension == ".pdf":
+        from langchain_community.document_loaders import PyPDFLoader
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+        
+    elif file_extension == ".docx":
+        from langchain_community.document_loaders import Docx2txtLoader
+        loader = Docx2txtLoader(file_path)
+        documents = loader.load()
+        
+    elif file_extension == ".txt":
+        from langchain_community.document_loaders import TextLoader
+        loader = TextLoader(file_path, encoding='utf-8')
+        documents = loader.load()
+        
+    else:
+        raise ValueError(f"Unsupported file type: {file_extension}")
 
     # Split document into chunks
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100
+        chunk_size=2000,
+        chunk_overlap=200
     )
     chunks = splitter.split_documents(documents)
 
@@ -37,14 +55,21 @@ def process_pdf(
         model_name=embeddings_model_name
     )
 
-    # Store in Chroma
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=persist_directory
-    )
-
-    vectorstore.persist()
+    # Load existing vectorstore or create new
+    if os.path.exists(persist_directory):
+        # Add to existing database
+        vectorstore = Chroma(
+            persist_directory=persist_directory,
+            embedding_function=embeddings
+        )
+        vectorstore.add_documents(chunks)
+    else:
+        # Create new database
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            persist_directory=persist_directory
+        )
 
     return vectorstore
 
@@ -72,7 +97,7 @@ def setup_qa_chain(
             model_id=model_id,
             params={
                 "temperature": 0.1,
-                "max_new_tokens": 512,
+                "max_new_tokens": 350,
                 "repetition_penalty": 1.1
             }
         )
@@ -80,10 +105,22 @@ def setup_qa_chain(
         raise ValueError("Only 'ibm/granite-3-8b-instruct' is supported.")
 
     # Prompt template
+    
     prompt_template = """
-    Use the following context to answer the question.
-    If the answer cannot be found in the context, say:
-    "I cannot find this information in the provided documents."
+    You are an intelligent AI assistant answering questions using the document context provided.
+
+    IMPORTANT RULES:
+    - Always rewrite and reorganize the information naturally — do NOT copy the document formatting.
+    - Adjust your answer style based on USER INTENT:
+        • If the user says "summarise", give a concise summary.
+        • If the user says "explain", "elaborate", "long answer", give a detailed explanation.
+        • If the user says "list", "objectives", "importance", "benefits", "factors", produce bullet points.
+        • If the user says "give examples", include examples.
+    - Write clean, easy-to-read answers like ChatGPT.
+    - You may combine or restructure information from the context.
+    - Only use the context for factual grounding. Do NOT hallucinate new facts.
+    - If the information is NOT in the context, reply:
+      "I cannot find this information in the provided documents."
 
     Context:
     {context}
@@ -91,13 +128,14 @@ def setup_qa_chain(
     Question:
     {question}
 
-    Answer:
+    Your answer:
     """
 
     PROMPT = PromptTemplate(
         template=prompt_template,
         input_variables=["context", "question"]
     )
+
 
     # Load vector store
     if use_local_path:
