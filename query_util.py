@@ -1,3 +1,7 @@
+import os
+import re
+from typing import List, Optional
+
 from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -6,143 +10,150 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-import os
+from langchain.schema import Document
+from langchain_core.retrievers import BaseRetriever
 
 
-# --------------------------------------------------
-# PDF → Chroma ingestion
-# --------------------------------------------------
+REFERENCE_PATTERNS = [r"\bretrieved\b", r"\bdoi\b", r"https?://", r"\b(19|20)\d{2}\b", r"\bet\s+al\.?\b"]
+
+def _looks_like_references(text: str) -> bool:
+    t = (text or "").lower()
+    hits = sum(1 for p in REFERENCE_PATTERNS if re.search(p, t))
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    many_short_lines = len(lines) >= 6 and sum(1 for ln in lines if len(ln) <= 60) / max(1, len(lines)) > 0.7
+    return hits >= 3 or (many_short_lines and hits >= 2)
+
+class FilteredRetriever(BaseRetriever):
+    def __init__(self, base_retriever: BaseRetriever, fallback_retriever: Optional[BaseRetriever] = None):
+        super().__init__()
+        self.base_retriever = base_retriever
+        self.fallback_retriever = fallback_retriever
+
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        docs = self.base_retriever.get_relevant_documents(query)
+        filtered = [d for d in docs if not _looks_like_references(d.page_content)]
+        if self.fallback_retriever and not filtered:
+            docs2 = self.fallback_retriever.get_relevant_documents(query + " definition")
+            filtered2 = [d for d in docs2 if not _looks_like_references(d.page_content)]
+            if filtered2:
+                return filtered2
+        return filtered or docs
+
+    async def aget_relevant_documents(self, query: str) -> List[Document]:
+        docs = await self.base_retriever.aget_relevant_documents(query)
+        filtered = [d for d in docs if not _looks_like_references(d.page_content)]
+        if self.fallback_retriever and not filtered:
+            docs2 = await self.fallback_retriever.aget_relevant_documents(query + " definition")
+            filtered2 = [d for d in docs2 if not _looks_like_references(d.page_content)]
+            if filtered2:
+                return filtered2
+        return filtered or docs
+
+
 def process_pdf(
     pdf_path,
     persist_directory="./chroma_db",
-    embeddings_model_name="sentence-transformers/all-MiniLM-L6-v2"
+    embeddings_model_name="sentence-transformers/all-MiniLM-L6-v2",
 ):
-    """
-    Load a PDF, split it into chunks, embed, and store in Chroma DB
-    """
-
-    # Load PDF
+    """Load PDF, chunk text, embed, store in Chroma."""
     loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
+    docs = loader.load()
 
-    # Split document into chunks
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100
+        chunk_size=1000,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=len,
     )
-    chunks = splitter.split_documents(documents)
+    chunks = splitter.split_documents(docs)
 
-    # Create embeddings
-    embeddings = HuggingFaceEmbeddings(
-        model_name=embeddings_model_name
-    )
+    embeddings = HuggingFaceEmbeddings(model_name=embeddings_model_name)
 
-    # Store in Chroma
-    vectorstore = Chroma.from_documents(
+    vectordb = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
-        persist_directory=persist_directory
+        persist_directory=persist_directory,
     )
 
-    vectorstore.persist()
+    vectordb.persist()
+    return vectordb
 
-    return vectorstore
 
-
-# --------------------------------------------------
-# RAG setup (LLM + Retriever)
-# --------------------------------------------------
-def setup_qa_chain(
-    local_vector_store_path=None,
-    vector_object=None,
-    use_local_path=True,
-    model_id="ibm/granite-3-8b-instruct",
-    embbedings_model_name="sentence-transformers/all-MiniLM-L6-v2"
-):
+def setup_qa_chain(local_vector_store_path="./chroma_db"):
     """
-    Set up a RetrievalQA RAG chain using Chroma + IBM Granite
+    Standard QA chain that DOES NOT filter out pages.
     """
+    # 1. Load the database
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectordb = Chroma(persist_directory=local_vector_store_path, embedding_function=embeddings)
 
-    # Configure IBM Granite model
-    if model_id == "ibm/granite-3-8b-instruct":
-        llm = WatsonxLLM(
-            url="https://us-south.ml.cloud.ibm.com",
-            apikey=os.environ.get("WATSONX_APIKEY"),
-            project_id=os.environ.get("IBM_PROJECT_ID"),
-            model_id=model_id,
-            params={
-                "temperature": 0.1,
-                "max_new_tokens": 512,
-                "repetition_penalty": 1.1
-            }
-        )
-    else:
-        raise ValueError("Only 'ibm/granite-3-8b-instruct' is supported.")
+    # 2. Use a standard retriever (Removed "FilteredRetriever")
+    # We increase k=5 to get more context
+    retriever = vectordb.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 5}
+    )
 
-    # Prompt template
+    # 3. Use a prompt that forces the AI to look for definitions
     prompt_template = """
-    Use the following context to answer the question.
-    If the answer cannot be found in the context, say:
-    "I cannot find this information in the provided documents."
-
+    You are a helpful research assistant. Use the provided context to answer the question.
+    
     Context:
     {context}
-
+    
     Question:
     {question}
-
+    
+    Instructions:
+    - If the context contains a definition, explain it clearly.
+    - If the context is just a Table of Contents, say "I found this in the Table of Contents, but I need to search the actual chapter."
+    - Answer in 2-3 concise bullet points.
+    
     Answer:
     """
 
-    PROMPT = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"]
+    PROMPT = PromptTemplate(input_variables=["context", "question"], template=prompt_template)
+
+    # 4. Configure the LLM
+    llm = WatsonxLLM(
+        url="https://us-south.ml.cloud.ibm.com",
+        apikey=os.getenv("WATSONX_APIKEY"),
+        project_id=os.getenv("IBM_PROJECT_ID"),
+        model_id="ibm/granite-3-8b-instruct",
+        params={
+            "temperature": 0.1,
+            "max_new_tokens": 300,
+            "repetition_penalty": 1.1
+        },
     )
 
-    # Load vector store
-    if use_local_path:
-        if not local_vector_store_path:
-            raise ValueError("`local_vector_store_path` is required.")
-
-        embeddings = HuggingFaceEmbeddings(
-            model_name=embbedings_model_name
-        )
-
-        retriever_source = Chroma(
-            persist_directory=local_vector_store_path,
-            embedding_function=embeddings
-        )
-    else:
-        if vector_object is None:
-            raise ValueError("`vector_object` must be provided.")
-        retriever_source = vector_object
-
-    # Create RetrievalQA chain
+    # 5. Build the chain
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
+        retriever=retriever,
         chain_type="stuff",
-        retriever=retriever_source.as_retriever(search_kwargs={"k": 4}),
         chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=True
+        return_source_documents=True,
     )
-
     return qa_chain
 
 
-# --------------------------------------------------
-# Question helper
-# --------------------------------------------------
 def ask_question(qa_chain, question):
-    """
-    Ask a question and return answer + sources
-    """
+    """Run the QA chain and return answer + UNIQUE sources."""
     result = qa_chain({"query": question})
 
-    return {
-        "answer": result["result"],
-        "sources": [
-            doc.metadata.get("source", "Unknown")
-            for doc in result["source_documents"]
-        ],
-        "confidence": len(result["source_documents"])
-    }
+    answer = result["result"]
+    source_docs = result["source_documents"]
+
+    unique = {}
+    for doc in source_docs:
+        src = doc.metadata.get("source", "Unknown")
+        page = doc.metadata.get("page", "N/A")
+        content = doc.page_content.strip()
+        key = (src, str(page))
+
+        if key not in unique or len(content) > len(unique[key]["content"]):
+            unique[key] = {"source": src, "page": page, "content": content}
+
+    formatted_sources = list(unique.values())[:3]
+    return {"answer": answer, "sources": formatted_sources, "confidence": len(formatted_sources)}
