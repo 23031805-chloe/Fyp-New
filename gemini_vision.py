@@ -1,59 +1,105 @@
+# gemini_vision.py
 import os
-import google.generativeai as genai
-from PIL import Image
-from dotenv import load_dotenv
+import time
+import json
+import base64
+import requests
+from typing import Optional
 
-def analyze_image(image_path: str, prompt: str = "Describe this image in a single paragraph. The entire response must be in Markdown.") -> str:
-    """
-    Analyze an image using Gemini Pro Vision model.
-    
-    Args:
-        image_path (str): Path to the image file
-        prompt (str): Custom prompt for image analysis (optional)
-    
-    Returns:
-        str: Generated description of the image
-    
-    Example usage:
-        # Basic usage
-        result = analyze_image("path/to/image.jpg")
-        
-        # With custom prompt
-        result = analyze_image(
-            "path/to/image.jpg",
-            "What objects can you identify in this image?"
-        )
-    """
-    load_dotenv()
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY not found in environment variables")
-    
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.0-flash')
-    
-    try:
-        image = Image.open(image_path)
-        response = model.generate_content([prompt, image])
-        return response.text
-    except Exception as e:
-        raise Exception(f"Error analyzing image: {str(e)}")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-if __name__ == "__main__":
-    # Example usage
-    try:
-        # Single image analysis
-        result = analyze_image("input_docs/prompt_royale.jpeg")
-        print(f"Analysis Result:\n{result}")
-        
-        # Multiple images with different prompts
-        images = [
-            ("image1.jpg", "Describe the main subject"),
-            ("image2.jpg", "List visible objects"),
-        ]
-        for img_path, prompt in images:
-            result = analyze_image(img_path, prompt)
-            print(f"\nAnalysis for {img_path}:\n{result}")
-            
-    except Exception as e:
-        print(f"Error: {e}")
+
+def _post_gemini(payload: dict, retries: int = 4) -> Optional[dict]:
+    if not GEMINI_API_KEY:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+
+    backoff = 1.5
+    for _ in range(retries):
+        try:
+            r = requests.post(url, headers=headers, params=params, data=json.dumps(payload), timeout=60)
+            if r.status_code == 429:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            time.sleep(backoff)
+            backoff *= 2
+    return None
+
+
+def _extract_text(data: dict) -> Optional[str]:
+    if not data:
+        return None
+    cand = data.get("candidates", [])
+    if not cand:
+        return None
+    parts = cand[0].get("content", {}).get("parts", [])
+    if not parts:
+        return None
+    return parts[0].get("text")
+
+
+def answer_from_context(question: str, context: str) -> Optional[str]:
+    prompt = f"""You are a document QA assistant.
+
+RULES:
+- Answer using ONLY the provided context.
+- If the answer is not in the context, say: "Not found in the selected document."
+- Keep it clear and direct.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+"""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 512},
+    }
+    data = _post_gemini(payload)
+    out = _extract_text(data)
+    return out.strip() if out else None
+
+
+def extract_text_from_image(image_bytes: bytes, mime_type: str = "image/png") -> Optional[str]:
+    """
+    Multimodal OCR-like extraction.
+    IMPORTANT: pass correct mime_type (image/jpeg for jpg).
+    """
+    if not GEMINI_API_KEY or not image_bytes:
+        return None
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = (
+        "Extract the visible text from this image as accurately as possible. "
+        "Focus on names, titles, headings, and captions. "
+        "Return ONLY the extracted text (no explanation)."
+    )
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 512},
+    }
+
+    data = _post_gemini(payload, retries=3)
+    out = _extract_text(data)
+    return out.strip() if out else None
+
+
+
+
+
