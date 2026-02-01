@@ -1,28 +1,260 @@
 import os
+import re
 import json
 import uuid
 import shutil
-import streamlit as st
-from dotenv import load_dotenv
-import query_util
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_ibm import WatsonxLLM
 import sqlite3
 import csv
 import datetime
 import hashlib
-import re
 import random
 import string
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+import streamlit as st
+from dotenv import load_dotenv
 
-# --- FEEDBACK FUNCTION ---
+import query_util
+
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_ibm import WatsonxLLM
+
+
+# ==================================================
+# Config (ONLY ONCE)
+# ==================================================
+load_dotenv()
+st.set_page_config(page_title="Document Q&A Chatbot", page_icon="🤖", layout="wide")
+
+
+# ==================================================
+# Wahyu: Follow-up question generation (KEEP)
+# ==================================================
+def extract_topic_from_question(question):
+    question_lower = (question or "").lower().strip()
+
+    remove_patterns = [
+        r'^what (is|are|does|do) (the |a |an )?',
+        r'^how (does|do|is|are) (the |a |an )?',
+        r'^why (is|are|does|do) (the |a |an )?',
+        r'^when (is|are|does|do) (the |a |an )?',
+        r'^where (is|are|does|do) (the |a |an )?',
+        r'^who (is|are|does|do) (the |a |an )?',
+        r'^can you (tell me about|explain|describe) (the |a |an )?',
+        r'^tell me about (the |a |an )?',
+        r'^explain (the |a |an )?',
+        r'^describe (the |a |an )?',
+    ]
+
+    topic = question_lower
+    for pattern in remove_patterns:
+        topic = re.sub(pattern, '', topic, flags=re.IGNORECASE)
+
+    topic = topic.rstrip('?').strip()
+
+    words = topic.split()[:4]
+    filler_words = {'the', 'a', 'an', 'this', 'that', 'these', 'those', 'in', 'on', 'at', 'to', 'for', 'with', 'according'}
+    meaningful_words = [w for w in words if w not in filler_words]
+
+    if meaningful_words:
+        return ' '.join(meaningful_words)
+    elif words:
+        return ' '.join(words)
+    else:
+        return None
+
+
+def extract_meaningful_entities(text, original_question):
+    entities = []
+
+    question_topic = extract_topic_from_question(original_question)
+    if question_topic and question_topic.lower() in (text or "").lower():
+        entities.append(question_topic)
+
+    blacklist = {
+        'document', 'documents', 'file', 'files', 'pdf', 'pdfs', 'text', 'content',
+        'information', 'data', 'section', 'page', 'paragraph', 'sentence',
+        'answer', 'question', 'query', 'response', 'result', 'output',
+        'system', 'chatbot', 'model', 'context', 'source', 'index',
+        'table', 'contents', 'introduction', 'conclusion', 'summary',
+    }
+
+    capitalized = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text or "")
+    for cap in capitalized:
+        if cap.lower() not in blacklist and len(cap) > 2:
+            entities.append(cap)
+
+    meaningful_patterns = [
+        r'\b(rag|retrieval-augmented generation|vector database|embedding|llm|large language model)\b',
+        r'\b(granite|langchain|chroma|faiss|milvus)\b',
+        r'\b(machine learning|artificial intelligence|deep learning|neural network)\b',
+        r'\b(capstone|project|implementation|development|pipeline)\b',
+        r'\b(phase \d+|week \d+|sprint|milestone|deliverable)\b',
+        r'\b(education|learning|teaching|curriculum|pedagogy|assessment)\b',
+        r'\b(student|instructor|professor|course|class|lecture)\b',
+        r'\b(chunking|indexing|retrieval|generation|processing)\b',
+        r'\b(api|interface|framework|architecture|component)\b',
+    ]
+
+    text_lower = (text or "").lower()
+    for pattern in meaningful_patterns:
+        matches = re.findall(pattern, text_lower, re.IGNORECASE)
+        for match in matches:
+            m = match if isinstance(match, str) else " ".join(match)
+            if m.lower() not in blacklist:
+                entities.append(m)
+
+    quoted = re.findall(r'"([^"]+)"', text or "")
+    for q in quoted:
+        if q.lower() not in blacklist and len(q.split()) <= 3:
+            entities.append(q)
+
+    unique_entities = []
+    seen = set()
+    for entity in entities:
+        el = entity.lower()
+        if el not in seen and el not in blacklist:
+            seen.add(el)
+            unique_entities.append(entity)
+
+    return unique_entities[:5]
+
+
+def generate_followup_questions(answer, original_question, conversation_history=None):
+    followups = []
+    answer_lower = (answer or "").lower()
+    question_lower = (original_question or "").lower()
+
+    asked_questions = set()
+    if conversation_history:
+        for msg in conversation_history:
+            if msg.get("role") == "assistant" and "followups" in msg:
+                asked_questions.update(msg["followups"])
+
+    entities = extract_meaningful_entities(answer or "", original_question or "")
+
+    if any(phrase in answer_lower for phrase in [
+        "does not provide", "cannot find", "no information",
+        "not mentioned", "not specified", "would be required"
+    ]):
+        main_topic = extract_topic_from_question(original_question)
+        if main_topic:
+            fallback_questions = [
+                f"What information about {main_topic} is available in the document?",
+                f"Can you tell me about related topics in the document?",
+                "What are the main topics covered in this document?",
+            ]
+        else:
+            fallback_questions = [
+                "What are the main topics covered in this document?",
+                "Can you provide a summary of the document?",
+                "What key information is available in the document?",
+            ]
+
+        for q in fallback_questions:
+            if q not in asked_questions and len(followups) < 3:
+                followups.append(q)
+        return followups[:3]
+
+    if entities:
+        entity = entities[0]
+        entity_questions = [
+            f"Can you explain more about {entity}?",
+            f"What are the key aspects of {entity}?",
+            f"How is {entity} implemented or used?",
+            f"What are examples of {entity}?",
+            f"What challenges are associated with {entity}?",
+        ]
+        for q in entity_questions:
+            if q not in asked_questions and len(followups) < 3:
+                followups.append(q)
+
+    if len(followups) < 3:
+        if any(word in answer_lower for word in ['phase', 'week', 'stage', 'step', 'process']):
+            candidates = [
+                "What happens in the next phase?",
+                "What are the deliverables for this phase?",
+                "What skills are needed for this phase?",
+            ]
+        elif any(word in answer_lower for word in ['technology', 'tool', 'framework', 'system']):
+            candidates = [
+                "What are the advantages of using this technology?",
+                "How do you get started with this?",
+                "What are common use cases?",
+            ]
+        elif any(word in answer_lower for word in ['assessment', 'criteria', 'evaluation']):
+            candidates = [
+                "How is this evaluated?",
+                "What are the scoring criteria?",
+                "What determines success?",
+            ]
+        elif any(word in answer_lower for word in ['team', 'student', 'group']):
+            candidates = [
+                "What are the team responsibilities?",
+                "How should teams collaborate?",
+                "What resources are available for teams?",
+            ]
+        else:
+            candidates = [
+                "Can you provide more details about this?",
+                "What are the practical applications?",
+                "What should I know to get started?",
+            ]
+
+        for q in candidates:
+            if q not in asked_questions and len(followups) < 3:
+                followups.append(q)
+
+    if len(followups) < 3:
+        if any(word in question_lower for word in ['what is', 'define', 'explain', 'describe']):
+            candidates = [
+                "Can you give a practical example?",
+                "How is this applied in real scenarios?",
+                "What are the benefits of this?",
+            ]
+        elif any(word in question_lower for word in ['how', 'process', 'implement']):
+            candidates = [
+                "What are common mistakes to avoid?",
+                "What tools or resources help with this?",
+                "What are best practices?",
+            ]
+        elif any(word in question_lower for word in ['why', 'reason', 'purpose']):
+            candidates = [
+                "What are the implications?",
+                "How does this compare to alternatives?",
+                "What are the trade-offs?",
+            ]
+        else:
+            candidates = [
+                "What else should I know about this topic?",
+                "Are there any prerequisites?",
+                "What are related concepts?",
+            ]
+
+        for q in candidates:
+            if q not in asked_questions and len(followups) < 3:
+                followups.append(q)
+
+    followups = list(dict.fromkeys(followups))[:3]
+    if not followups:
+        generic_options = [
+            "What are the key takeaways?",
+            "Can you elaborate further?",
+            "What related information is available?",
+        ]
+        followups = [q for q in generic_options if q not in asked_questions][:3]
+
+    return followups
+
+
+# ==================================================
+# Feedback (Xinru) — kept (optional)
+# ==================================================
 def save_feedback(query, response, rating, comment=""):
     try:
         file_exists = os.path.isfile('feedback.csv')
@@ -32,28 +264,24 @@ def save_feedback(query, response, rating, comment=""):
                 writer.writerow(['Timestamp', 'Query', 'Response', 'Rating', 'Comment'])
             writer.writerow([datetime.datetime.now(), query, response, rating, comment])
     except PermissionError:
-        st.error("ΓÜá∩╕Å Could not save feedback! Please close 'feedback.csv'.")
+        st.error("⚠️ Could not save feedback! Please close 'feedback.csv'.")
 
-# --- CUSTOM CSS STYLING ---
+
+# ==================================================
+# Login + Email verification (Kaixin) — kept
+# ==================================================
 def load_css():
     st.markdown("""
         <style>
-            /* 1. Global Background */
             .stApp { background-color: #f8f9fa; }
-            
-            /* 2. Center the Login Card */
             .css-1r6slb0, .css-12oz5g7 { max-width: 450px; padding-top: 5rem; }
-            
-            /* 3. The Card Itself */
             div[data-testid="stVerticalBlock"] > div[style*="background-color"] {
                 background-color: #ffffff;
                 padding: 40px;
                 border-radius: 12px;
-                box-shadow: 0 4px 24px rgba(0,0,0,0.08); 
+                box-shadow: 0 4px 24px rgba(0,0,0,0.08);
                 border: 1px solid #f0f0f0;
             }
-
-            /* 4. Input Fields */
             .stTextInput input {
                 background-color: #ffffff;
                 border: 1px solid #e0e0e0;
@@ -62,11 +290,9 @@ def load_css():
                 color: #333;
             }
             .stTextInput input:focus {
-                border-color: #2563eb; 
-                box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.1); 
+                border-color: #2563eb;
+                box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.1);
             }
-            
-            /* 5. Buttons */
             .stButton button {
                 width: 100%;
                 background-color: #2563eb !important;
@@ -82,51 +308,49 @@ def load_css():
                 background-color: #1d4ed8 !important;
                 transform: translateY(-1px);
             }
-            
-            /* 6. Tabs - Blue Theme */
             .stTabs [data-baseweb="tab"] {
                 color: #64748b; font-weight: 500; border: none; background-color: transparent;
             }
             .stTabs [aria-selected="true"] {
-                color: #2563eb !important; 
-                border-bottom-color: #2563eb !important; 
-                border-bottom-width: 3px !important; 
+                color: #2563eb !important;
+                border-bottom-color: #2563eb !important;
+                border-bottom-width: 3px !important;
             }
             .stTabs [data-baseweb="tab-list"] {
                 gap: 20px; border-bottom: 1px solid #f0f0f0; margin-bottom: 25px;
             }
-
-            /* 7. Typography */
             h2 { color: #1e293b; font-weight: 700; letter-spacing: -0.5px; }
             p { color: #64748b; }
         </style>
     """, unsafe_allow_html=True)
 
-# --- VALIDATION HELPERS ---
+
 def is_valid_email(email):
     email = (email or "").strip().lower()
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email)
 
+
 def is_valid_password(password):
     if len(password) < 12:
-        return False, "ΓÜá∩╕Å Password must be at least 12 characters."
+        return False, "⚠️ Password must be at least 12 characters."
     pattern = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&_])[A-Za-z\d@$!%*?&_]{12,}$"
-    if not re.match(pattern, password):
-        return False, "ΓÜá∩╕Å Must have Uppercase, Lowercase, Number & Symbol (@$!%*?&_)."
+    if not re.match(pattern, password or ""):
+        return False, "⚠️ Must have Uppercase, Lowercase, Number & Symbol (@$!%*?&_)."
     return True, "Valid"
+
 
 def send_verification_email(to_email, code):
     sender_email = os.getenv("GMAIL_USER")
     sender_password = os.getenv("GMAIL_APP_PASSWORD")
-    
+
     if not sender_email or not sender_password:
-        return False, "ΓÜá∩╕Å Setup Error: Missing GMAIL_USER or GMAIL_APP_PASSWORD in .env"
+        return False, "⚠️ Setup Error: Missing GMAIL_USER or GMAIL_APP_PASSWORD in .env"
 
     try:
         msg = MIMEMultipart()
         msg['From'] = sender_email
         msg['To'] = to_email
-        msg['Subject'] = "≡ƒöÉ Your Verification Code"
+        msg['Subject'] = "Your Verification Code"
 
         body = f"""
         <html><body>
@@ -142,116 +366,47 @@ def send_verification_email(to_email, code):
         server.login(sender_email, sender_password)
         server.sendmail(sender_email, to_email, msg.as_string())
         server.quit()
-        return True, "Γ£à Email Sent!"
+        return True, "✅ Email Sent!"
     except Exception as e:
-        return False, f"Γ¥î Email Failed: {str(e)}"
+        return False, f"❌ Email Failed: {str(e)}"
 
-# --- DATABASE SETUP ---
+
 def init_db():
-    try:
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        # New Table Structure: Username, Email, Password Hash
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                email TEXT UNIQUE,
-                password_hash TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"DB Init Error: {e}")
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            email TEXT UNIQUE,
+            password_hash TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-init_db()
 
-# --- AUTH FUNCTIONS ---
 def make_hashes(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
+
 def check_hashes(password, hashed_text):
     return make_hashes(password) == hashed_text
+
 
 def create_user(username, email, password):
     try:
         conn = sqlite3.connect('users.db')
         c = conn.cursor()
-        c.execute('INSERT INTO users VALUES (?, ?, ?)', 
-                 (username, email, make_hashes(password)))
+        c.execute('INSERT INTO users VALUES (?, ?, ?)',
+                  (username, email, make_hashes(password)))
         conn.commit()
         conn.close()
-        return True, "Γ£à Account created! Please Login."
+        return True, "✅ Account created! Please Login."
     except sqlite3.IntegrityError:
-        return False, "ΓÜá∩╕Å Username or Email already exists."
-    except Exception as e:
-        return False, f"Error: {e}"
-    
-def update_user_details(current_username, old_password, new_username, new_email, new_password=None):
-    """Updates profile, but ONLY if the old password is correct."""
-    try:
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        
-        # 1. VERIFY OLD PASSWORD FIRST
-        c.execute("SELECT password_hash FROM users WHERE username = ?", (current_username,))
-        result = c.fetchone()
-        if not result:
-            conn.close()
-            return False, "User not found."
-            
-        stored_hash = result[0]
-        if not check_hashes(old_password, stored_hash):
-            conn.close()
-            return False, "Γ¥î Incorrect Current Password. Changes NOT saved."
-
-        # 2. Check if new username/email is already taken by SOMEONE ELSE
-        if new_username != current_username:
-            c.execute("SELECT * FROM users WHERE username = ?", (new_username,))
-            if c.fetchone(): 
-                conn.close()
-                return False, "Username already taken."
-            
-        if new_email:
-            # Get current email to see if it changed
-            c.execute("SELECT email FROM users WHERE username = ?", (current_username,))
-            curr_email = c.fetchone()[0]
-            if new_email != curr_email:
-                c.execute("SELECT * FROM users WHERE email = ?", (new_email,))
-                if c.fetchone(): 
-                    conn.close()
-                    return False, "Email already in use."
-
-        # 3. Update the record
-        if new_password:
-            # Update everything including password
-            c.execute('''UPDATE users SET username = ?, email = ?, password_hash = ? 
-                         WHERE username = ?''', 
-                      (new_username, new_email, make_hashes(new_password), current_username))
-        else:
-            # Update only profile info
-            c.execute('''UPDATE users SET username = ?, email = ? 
-                         WHERE username = ?''', 
-                      (new_username, new_email, current_username))
-            
-        conn.commit()
-        conn.close()
-        return True, "Γ£à Profile updated! Please re-login."
+        return False, "⚠️ Username or Email already exists."
     except Exception as e:
         return False, f"Error: {e}"
 
-def delete_user_account(username):
-    """Permanently deletes the user"""
-    try:
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        c.execute("DELETE FROM users WHERE username = ?", (username,))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(e)
-        return False
 
 def check_login(username, password):
     try:
@@ -263,11 +418,11 @@ def check_login(username, password):
         if data and check_hashes(password, data[0]):
             return True
         return False
-    except:
+    except Exception:
         return False
 
+
 def check_email_exists(email):
-    """Returns username if email exists, else None"""
     try:
         conn = sqlite3.connect('users.db')
         c = conn.cursor()
@@ -275,167 +430,146 @@ def check_email_exists(email):
         data = c.fetchone()
         conn.close()
         return data[0] if data else None
-    except:
+    except Exception:
         return None
 
+
 def reset_password_in_db(email, new_password):
-    """Updates the password for the given email"""
     try:
         conn = sqlite3.connect('users.db')
         c = conn.cursor()
-        c.execute('UPDATE users SET password_hash = ? WHERE email = ?', 
-                 (make_hashes(new_password), email))
+        c.execute('UPDATE users SET password_hash = ? WHERE email = ?',
+                  (make_hashes(new_password), email))
         conn.commit()
         conn.close()
         return True
-    except Exception as e:
-        print(e)
+    except Exception:
         return False
 
-# --- LOGIN PAGE LOGIC ---
+
 def login_signup_page():
     load_css()
-    
-    with st.container():
-        col1, col2 = st.columns([1, 1])
-        
-        # LEFT: Marketing
-        with col1:
-            st.markdown("<div style='margin-top: 50px;'></div>", unsafe_allow_html=True)
-            st.markdown("# Document Retrieval System")
-            st.markdown("""
-            ### Unlock the power of your Documents.
-            This Intelligent Document System uses **IBM Granite 3** and **RAG Technology**.
-            
-            **Features:**
-            - ΓÜí Instant Summaries
-            - ≡ƒöì Source Citations
-            - ≡ƒöÉ Enterprise Security
-            """)
-            st.markdown("---")
-            st.caption("Powered by LangChain & WatsonX")
+    st.title("Document Retrieval System")
 
-        # RIGHT: Login Form
-        with col2:
-            with st.container():
-                st.markdown("### Get Started")
-                tab1, tab2, tab3 = st.tabs(["Log In", "Sign Up", "Recover"])
+    tab1, tab2, tab3 = st.tabs(["Log In", "Sign Up", "Recover"])
 
-                # TAB 1: LOGIN
-                with tab1:
-                    username = st.text_input("Username", key="login_user")
-                    password = st.text_input("Password", type="password", key="login_pass")
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("Sign In"):
-                        if check_login(username, password):
-                            st.session_state.logged_in = True
-                            st.session_state.current_user = username
-                            st.toast("Welcome back!", icon="👋")
-                            st.rerun()
+    with tab1:
+        username = st.text_input("Username", key="login_user")
+        password = st.text_input("Password", type="password", key="login_pass")
+        if st.button("Sign In"):
+            if check_login(username, password):
+                st.session_state.logged_in = True
+                st.session_state.current_user = username
+                st.toast("Welcome back!", icon="👋")
+                st.rerun()
+            else:
+                st.error("❌ Incorrect username or password")
+
+    with tab2:
+        if "signup_stage" not in st.session_state:
+            st.session_state.signup_stage = 1
+
+        if st.session_state.signup_stage == 1:
+            new_user = st.text_input("Username", key="new_user")
+            new_email = st.text_input("Email", key="new_email")
+            new_pass = st.text_input("Password", type="password", key="new_pass")
+            confirm_pass = st.text_input("Confirm Password", type="password", key="confirm_pass")
+
+            if st.button("Verify Email & Create"):
+                valid_p, msg = is_valid_password(new_pass)
+                if not new_user:
+                    st.warning("Username missing")
+                elif not is_valid_email(new_email):
+                    st.warning("Invalid Email")
+                elif not valid_p:
+                    st.warning(msg)
+                elif new_pass != confirm_pass:
+                    st.error("Passwords don't match")
+                elif check_email_exists(new_email):
+                    st.error("Email already registered!")
+                else:
+                    code = ''.join(random.choices(string.digits, k=6))
+                    success, email_msg = send_verification_email(new_email, code)
+                    if success:
+                        st.session_state.signup_otp = code
+                        st.session_state.signup_data = (new_user, new_email, new_pass)
+                        st.session_state.signup_stage = 2
+                        st.toast("📩 Check your inbox!", icon="✅")
+                        st.rerun()
+                    else:
+                        st.error(email_msg)
+
+        elif st.session_state.signup_stage == 2:
+            st.info(f"Code sent to {st.session_state.signup_data[1]}")
+            otp_input = st.text_input("Enter Email Code", key="signup_otp_code")
+
+            if st.button("Confirm & Register"):
+                if otp_input == st.session_state.signup_otp:
+                    u, e, p = st.session_state.signup_data
+                    success, db_msg = create_user(u, e, p)
+                    if success:
+                        st.success(db_msg)
+                        st.session_state.signup_stage = 1
+                    else:
+                        st.error(db_msg)
+                else:
+                    st.error("❌ Invalid Code")
+
+            if st.button("Back"):
+                st.session_state.signup_stage = 1
+                st.rerun()
+
+    with tab3:
+        if "reset_stage" not in st.session_state:
+            st.session_state.reset_stage = 1
+
+        if st.session_state.reset_stage == 1:
+            reset_email = st.text_input("Enter Registered Email", key="reset_email_input")
+            if st.button("Send Reset Code"):
+                if check_email_exists(reset_email):
+                    code = ''.join(random.choices(string.digits, k=6))
+                    success, email_msg = send_verification_email(reset_email, code)
+                    if success:
+                        st.session_state.reset_otp = code
+                        st.session_state.reset_email = reset_email
+                        st.session_state.reset_stage = 2
+                        st.toast("📩 Code sent!", icon="✅")
+                        st.rerun()
+                    else:
+                        st.error(email_msg)
+                else:
+                    st.error("Email not found.")
+
+        elif st.session_state.reset_stage == 2:
+            st.info(f"Check {st.session_state.reset_email} for code")
+            otp_input = st.text_input("Enter Code", key="reset_otp_input")
+            new_p = st.text_input("New Password", type="password", key="reset_new_p")
+
+            if st.button("Change Password"):
+                if otp_input == st.session_state.reset_otp:
+                    valid, msg = is_valid_password(new_p)
+                    if valid:
+                        if reset_password_in_db(st.session_state.reset_email, new_p):
+                            st.success("✅ Password Changed! Please Log In.")
+                            st.session_state.reset_stage = 1
                         else:
-                            st.error("❌ Incorrect username or password")
-
-                # TAB 2: SIGN UP
-                with tab2:
-                    if "signup_stage" not in st.session_state: st.session_state.signup_stage = 1
-                    
-                    if st.session_state.signup_stage == 1:
-                        new_user = st.text_input("Username", key="new_user")
-                        new_email = st.text_input("Email", key="new_email")
-                        new_pass = st.text_input("Password", type="password", key="new_pass", help="12+ chars, mixed case, symbols.")
-                        confirm_pass = st.text_input("Confirm Password", type="password", key="confirm_pass")
-                        
-                        if st.button("Verify Email & Create"):
-                            valid_p, msg = is_valid_password(new_pass)
-                            if not new_user: st.warning("Username missing")
-                            elif not is_valid_email(new_email): st.warning("Invalid Email")
-                            elif not valid_p: st.warning(msg)
-                            elif new_pass != confirm_pass: st.error("Passwords don't match")
-                            elif check_email_exists(new_email): st.error("Email already registered!")
-                            else:
-                                # SEND EMAIL
-                                code = ''.join(random.choices(string.digits, k=6))
-                                success, email_msg = send_verification_email(new_email, code)
-                                if success:
-                                    st.session_state.signup_otp = code
-                                    st.session_state.signup_data = (new_user, new_email, new_pass)
-                                    st.session_state.signup_stage = 2
-                                    st.toast("≡ƒôº Check your inbox!", icon="Γ£à")
-                                    st.rerun()
-                                else:
-                                    st.error(email_msg)
-
-                    elif st.session_state.signup_stage == 2:
-                        st.info(f"≡ƒôº Code sent to {st.session_state.signup_data[1]}")
-                        otp_input = st.text_input("Enter Email Code", key="signup_otp_code")
-                        
-                        if st.button("Confirm & Register"):
-                            if otp_input == st.session_state.signup_otp:
-                                u, e, p = st.session_state.signup_data
-                                success, db_msg = create_user(u, e, p)
-                                if success:
-                                    st.success(db_msg)
-                                    st.session_state.signup_stage = 1
-                                else: st.error(db_msg)
-                            else: st.error("Γ¥î Invalid Code")
-                        
-                        if st.button("Back"):
-                            st.session_state.signup_stage = 1
-                            st.rerun()
-
-                # TAB 3: RECOVER
-                with tab3:
-                    if "reset_stage" not in st.session_state: st.session_state.reset_stage = 1
-                    
-                    if st.session_state.reset_stage == 1:
-                        reset_email = st.text_input("Enter Registered Email", key="reset_email_input")
-                        if st.button("Send Reset Code"):
-                            if check_email_exists(reset_email):
-                                code = ''.join(random.choices(string.digits, k=6))
-                                success, email_msg = send_verification_email(reset_email, code)
-                                if success:
-                                    st.session_state.reset_otp = code
-                                    st.session_state.reset_email = reset_email
-                                    st.session_state.reset_stage = 2
-                                    st.toast("≡ƒôº Code sent!", icon="Γ£à")
-                                    st.rerun()
-                                else: st.error(email_msg)
-                            else: st.error("Email not found.")
-                    
-                    elif st.session_state.reset_stage == 2:
-                        st.info(f"Check {st.session_state.reset_email} for code")
-                        otp_input = st.text_input("Enter Code", key="reset_otp_input")
-                        new_p = st.text_input("New Password", type="password", key="reset_new_p")
-                        
-                        if st.button("Change Password"):
-                            if otp_input == st.session_state.reset_otp:
-                                valid, msg = is_valid_password(new_p)
-                                if valid:
-                                    if reset_password_in_db(st.session_state.reset_email, new_p):
-                                        st.success("Γ£à Password Changed! Please Log In.")
-                                        st.session_state.reset_stage = 1
-                                    else: st.error("DB Error")
-                                else: st.warning(msg)
-                            else: st.error("Invalid Code")
-
-# --------------------------------------------------
-# Setup
-# --------------------------------------------------
-st.set_page_config(page_title="Document Q&A Chatbot", page_icon="🤖", layout="wide")
-load_dotenv()
+                            st.error("DB Error")
+                    else:
+                        st.warning(msg)
+                else:
+                    st.error("Invalid Code")
 
 
+# ==================================================
+# Projects + Chats (You) — kept
+# ==================================================
 BASE_PROJECT_DIR = "./projects"
 GLOBAL_DIR = "./global"
 os.makedirs(BASE_PROJECT_DIR, exist_ok=True)
 os.makedirs(GLOBAL_DIR, exist_ok=True)
-
 GLOBAL_CHATS_FILE = os.path.join(GLOBAL_DIR, "chats.json")
 
 
-# --------------------------------------------------
-# JSON helpers
-# --------------------------------------------------
 def _safe_load_json(path, default):
     if not os.path.exists(path):
         return default
@@ -454,9 +588,6 @@ def _safe_save_json(path, data):
     os.replace(tmp, path)
 
 
-# --------------------------------------------------
-# Projects + chats storage
-# --------------------------------------------------
 def project_paths(project_name: str):
     base = os.path.join(BASE_PROJECT_DIR, project_name)
     return {
@@ -476,7 +607,6 @@ def init_project(project_name: str):
 
 
 def _normalize_project_name(name: str) -> str:
-    """Basic sanitization to avoid weird paths."""
     name = (name or "").strip()
     name = name.replace("/", "_").replace("\\", "_")
     name = " ".join(name.split())
@@ -503,7 +633,7 @@ def rename_project(old_name: str, new_name: str):
         return False, "A project with that name already exists."
 
     try:
-        shutil.move(old_base, new_base)  # moves folder + chroma + chats + input
+        shutil.move(old_base, new_base)
         init_project(new_name)
         return True, "Project renamed."
     except Exception as e:
@@ -583,9 +713,9 @@ def get_uploaded_files_for_project(project_name: str):
     return sorted(files, key=lambda x: x.lower())
 
 
-# --------------------------------------------------
-# Cache heavy objects (fix long loading)
-# --------------------------------------------------
+# ==================================================
+# LangChain / RAG (shared)
+# ==================================================
 @st.cache_resource(show_spinner=False)
 def get_embeddings():
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -608,10 +738,9 @@ def get_vectorstore(persist_dir: str):
     return Chroma(persist_directory=persist_dir, embedding_function=get_embeddings())
 
 
-def build_chain(persist_dir: str):
+def build_chain(persist_dir: str, memory: ConversationBufferMemory):
     vectorstore = get_vectorstore(persist_dir)
     llm = get_llm()
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True, output_key="answer")
     return ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
@@ -620,33 +749,60 @@ def build_chain(persist_dir: str):
     )
 
 
-# --------------------------------------------------
+def safe_process_document(path: str, persist_dir: str):
+    """
+    Calls your query_util indexing function safely.
+    Adjust here if your function name differs.
+    """
+    if hasattr(query_util, "process_document"):
+        query_util.process_document(path, persist_directory=persist_dir)
+        return
+    # Fallback (if your util uses process_pdf instead)
+    if hasattr(query_util, "process_pdf"):
+        query_util.process_pdf(path)
+        return
+    raise AttributeError("query_util needs process_document(...) or process_pdf(...)")
+
+
+# ==================================================
 # Session state
-# --------------------------------------------------
-if "current_project" not in st.session_state:
-    st.session_state.current_project = "Default"
-
-# active_scope: "global" or "project"
-if "active_scope" not in st.session_state:
-    st.session_state.active_scope = "global"
-
-if "active_chat_id" not in st.session_state:
-    st.session_state.active_chat_id = None
-
-if "search_query" not in st.session_state:
-    st.session_state.search_query = ""
+# ==================================================
+init_db()
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+if "current_user" not in st.session_state:
+    st.session_state.current_user = None
 
+if "current_project" not in st.session_state:
+    st.session_state.current_project = "Default"
+if "active_scope" not in st.session_state:
+    st.session_state.active_scope = "global"  # "global" or "project"
+if "active_chat_id" not in st.session_state:
+    st.session_state.active_chat_id = None
+if "search_query" not in st.session_state:
+    st.session_state.search_query = ""
+
+# for follow-up button clicks
+if "queued_prompt" not in st.session_state:
+    st.session_state.queued_prompt = None
+
+# memory per chat
+if "chat_memories" not in st.session_state:
+    st.session_state.chat_memories = {}  # key: f"{scope}:{chat_id}" -> ConversationBufferMemory
+
+
+# ==================================================
+# Login gate
+# ==================================================
 if not st.session_state.logged_in:
     login_signup_page()
     st.stop()
 
 
-# --------------------------------------------------
-# Load data
-# --------------------------------------------------
+# ==================================================
+# Load chats
+# ==================================================
 projects = list_projects()
 if st.session_state.current_project not in projects:
     st.session_state.current_project = "Default"
@@ -690,11 +846,19 @@ ensure_active_chat()
 current_chat = find_chat(st.session_state.active_scope, st.session_state.active_chat_id)
 
 
-# --------------------------------------------------
-# Sidebar (ChatGPT-like separation)
-# --------------------------------------------------
+# ==================================================
+# Sidebar (projects + chats + upload)
+# ==================================================
 with st.sidebar:
-    # Top: New chat (GLOBAL like ChatGPT)
+    st.markdown(f"**Logged in as:** {st.session_state.current_user}")
+
+    if st.button("🚪 Log out", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.current_user = None
+        st.rerun()
+
+    st.markdown("---")
+
     if st.button("✏️ New chat", use_container_width=True):
         new_chat = make_new_chat()
         global_chats.append(new_chat)
@@ -706,41 +870,29 @@ with st.sidebar:
     st.text_input("Search chats", key="search_query", placeholder="Search chats…")
     st.markdown("---")
 
-    # Projects
     st.markdown("### Projects")
-
-    selected_project = st.selectbox(
-        "Select project",
-        projects,
-        index=projects.index(project_name),
-    )
+    selected_project = st.selectbox("Select project", projects, index=projects.index(project_name))
     if selected_project != project_name:
         st.session_state.current_project = selected_project
-        # do NOT force scope change; keep what user was using
         st.session_state.active_chat_id = None
         st.rerun()
 
-    new_project_name = st.text_input("New project name", placeholder="e.g. Test Confirmation")
+    new_project_name = st.text_input("New project name", placeholder="e.g. FYP Chatbot")
     if st.button("New project", use_container_width=True):
         name = _normalize_project_name(new_project_name)
         if name:
             init_project(name)
             st.session_state.current_project = name
-            # switch to that project's chats area
             st.session_state.active_scope = "project"
             st.session_state.active_chat_id = None
             st.rerun()
 
-    # ------------------------------
-    # Manage selected project (Update + Delete)
-    # ------------------------------
     st.markdown("#### Manage project")
-
-    with st.expander("✏️ Rename project", expanded=False):
+    with st.expander("✏️ Rename project"):
         if project_name == "Default":
             st.info("Default project cannot be renamed.")
         else:
-            rename_to = st.text_input("Rename to", key="rename_project_to", placeholder="e.g. FYP Chatbot")
+            rename_to = st.text_input("Rename to", key="rename_project_to", placeholder="e.g. Capstone Chatbot")
             if st.button("Rename", key="btn_rename_project", use_container_width=True):
                 ok, msg = rename_project(project_name, rename_to)
                 if ok:
@@ -752,11 +904,11 @@ with st.sidebar:
                 else:
                     st.error(msg)
 
-    with st.expander("🗑️ Delete project", expanded=False):
+    with st.expander("🗑️ Delete project"):
         if project_name == "Default":
             st.info("Default project cannot be deleted.")
         else:
-            st.warning("This will permanently delete the project folder (documents, chats, vector DB).")
+            st.warning("This deletes the project folder (documents, chats, vector DB).")
             confirm = st.checkbox(f"I understand. Delete '{project_name}' permanently.", key="confirm_delete_project")
             if st.button("Delete", key="btn_delete_project", use_container_width=True, disabled=not confirm):
                 ok, msg = delete_project(project_name)
@@ -770,10 +922,7 @@ with st.sidebar:
                     st.error(msg)
 
     st.markdown("---")
-
-    # Project chats list + project new chat
     st.markdown(f"### {project_name} chats")
-
     if st.button("New project chat", use_container_width=True):
         new_chat = make_new_chat()
         project_chats.append(new_chat)
@@ -784,7 +933,6 @@ with st.sidebar:
 
     def render_chat_list(chats, scope: str):
         q = (st.session_state.search_query or "").strip().lower()
-
         filtered = []
         for c in chats:
             title = (c.get("title") or "New chat")
@@ -816,16 +964,11 @@ with st.sidebar:
                     st.rerun()
 
     render_chat_list(project_chats, "project")
-
     st.markdown("---")
-
-    # GLOBAL chats section (Your chats)
     st.markdown("### Your chats")
     render_chat_list(global_chats, "global")
 
     st.markdown("---")
-
-    # Uploaded documents (project-specific, kept)
     st.markdown("### 📎 Uploaded documents")
     uploaded_files = get_uploaded_files_for_project(project_name)
     if uploaded_files:
@@ -837,9 +980,9 @@ with st.sidebar:
     uploaded = st.file_uploader("Upload PDF / Word / Text", type=["pdf", "docx", "txt"])
 
 
-# --------------------------------------------------
-# File processing (PROJECT KB only)
-# --------------------------------------------------
+# ==================================================
+# File processing (PROJECT KB)
+# ==================================================
 if uploaded:
     init_project(project_name)
     paths = project_paths(project_name)
@@ -849,9 +992,8 @@ if uploaded:
         f.write(uploaded.getbuffer())
 
     with st.spinner("Indexing document…"):
-        query_util.process_document(file_path, persist_directory=paths["chroma"])
+        safe_process_document(file_path, persist_dir=paths["chroma"])
 
-    # force fresh vectorstore load next time
     try:
         get_vectorstore.clear()
     except Exception:
@@ -861,9 +1003,9 @@ if uploaded:
     st.rerun()
 
 
-# --------------------------------------------------
+# ==================================================
 # Main UI
-# --------------------------------------------------
+# ==================================================
 st.title("🤖 Document Q&A Chatbot")
 st.markdown("Ask me anything about your documents!")
 
@@ -871,14 +1013,69 @@ if current_chat is None:
     st.info("No chat selected.")
     st.stop()
 
-# Render messages
-for msg in current_chat["messages"]:
+
+def chat_key(scope: str, chat_id: str) -> str:
+    return f"{scope}:{chat_id}"
+
+
+def get_memory_for_chat(scope: str, chat_id: str) -> ConversationBufferMemory:
+    key = chat_key(scope, chat_id)
+    if key not in st.session_state.chat_memories:
+        st.session_state.chat_memories[key] = ConversationBufferMemory(
+            memory_key="chat_history", return_messages=True, output_key="answer"
+        )
+    return st.session_state.chat_memories[key]
+
+
+def render_sources(docs):
+    if not docs:
+        return
+    with st.expander("📚 View Sources"):
+        seen = set()
+        idx = 1
+        for doc in docs:
+            file = doc.metadata.get("source", "Unknown")
+            page = doc.metadata.get("page", "N/A")
+            key = (file, str(page))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            st.subheader(f"📄 Source {idx}")
+            st.write(f"**File:** {os.path.basename(file)}")
+            st.write(f"**Page:** {page}")
+            text = (doc.page_content or "").strip()
+            st.write(text[:1500] + ("…" if len(text) > 1500 else ""))
+            st.markdown("---")
+            idx += 1
+
+
+# Render messages + follow-up buttons
+for mi, msg in enumerate(current_chat["messages"]):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-prompt = st.chat_input("Ask a question about your documents…")
+        if msg.get("sources"):
+            render_sources(msg["sources"])
+
+        if msg.get("followups"):
+            st.markdown("---")
+            st.markdown("**💡 You might also want to ask:**")
+            for qi, fq in enumerate(msg["followups"]):
+                if st.button(fq, key=f"fu_{current_chat['id']}_{mi}_{qi}", use_container_width=True):
+                    st.session_state.queued_prompt = fq
+                    st.rerun()
+
+
+# Input (supports follow-up click -> queued_prompt)
+prompt = None
+if st.session_state.queued_prompt:
+    prompt = st.session_state.queued_prompt
+    st.session_state.queued_prompt = None
+else:
+    prompt = st.chat_input("Ask a question about your documents…")
+
 if prompt:
-    # auto-title like GPT (first message)
     if len(current_chat["messages"]) == 0:
         current_chat["title"] = auto_title_from_prompt(prompt)
 
@@ -886,50 +1083,59 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Choose KB:
-    # - project chats use project KB
-    # - global chats: NO KB by default (like ChatGPT "general chat")
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             docs = []
+            answer = ""
+            scope = st.session_state.active_scope
+
             try:
-                if st.session_state.active_scope == "project":
+                if scope == "project":
                     paths = project_paths(project_name)
                     init_project(project_name)
-                    chain = build_chain(paths["chroma"])
+                    memory = get_memory_for_chat(scope, current_chat["id"])
+                    chain = build_chain(paths["chroma"], memory=memory)
                     response = chain({"question": prompt})
                     answer = response.get("answer", "⚠ No answer returned.")
-                    docs = response.get("source_documents", [])
+                    docs = response.get("source_documents", []) or []
                 else:
                     llm = get_llm()
                     answer = llm.invoke(prompt)
+
             except Exception as e:
                 answer = "❌ Error generating answer. Check your API keys / Watsonx configuration."
                 st.error(str(e))
 
             st.markdown(answer)
 
-            if st.session_state.active_scope == "project" and docs:
-                with st.expander("📚 View Sources"):
-                    seen = set()
-                    for i, doc in enumerate(docs, 1):
-                        file = doc.metadata.get("source", "Unknown")
-                        page = doc.metadata.get("page")
-                        key = (file, page)
-                        if key in seen:
-                            continue
-                        seen.add(key)
+            if scope == "project" and docs:
+                render_sources(docs)
 
-                        st.subheader(f"📄 Source {i}")
-                        st.write(f"**File:** {file}")
-                        if page not in [None, "N/A"]:
-                            st.write(f"**Page:** {page}")
-                        st.write((doc.page_content or "")[:1500] + "…")
-                        st.markdown("---")
+            followups = generate_followup_questions(
+                answer,
+                prompt,
+                conversation_history=current_chat["messages"]
+            )
 
-    current_chat["messages"].append({"role": "assistant", "content": answer})
+            if followups:
+                st.markdown("---")
+                st.markdown("**💡 You might also want to ask:**")
+                for qi, fq in enumerate(followups):
+                    if st.button(fq, key=f"fu_live_{current_chat['id']}_{qi}", use_container_width=True):
+                        st.session_state.queued_prompt = fq
+                        st.rerun()
 
-    # Persist
+    # store assistant message + citations + followups
+    current_chat["messages"].append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": docs if st.session_state.active_scope == "project" else [],
+            "followups": followups,
+        }
+    )
+
+    # Persist to JSON
     if st.session_state.active_scope == "project":
         save_project_chats(project_name, project_data)
     else:
