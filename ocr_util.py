@@ -1,4 +1,3 @@
-# ocr_util.py
 import re
 from typing import List
 
@@ -21,7 +20,8 @@ def extract_text_from_image(pil_img) -> str:
     try:
         reader = easyocr.Reader(["en"], gpu=False)
         arr = np.array(pil_img)
-        results = reader.readtext(arr, detail=0)  # returns list[str]
+        results = reader.readtext(arr, detail=0)  # list[str]
         return _clean_lines(results)
     except Exception:
         return ""
+
